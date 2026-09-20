@@ -1,7 +1,6 @@
 """
 OSINT Bot — всё в одном файле.
 Telegram-бот для OSINT-разведки по открытым источникам.
-Модули: email, username, phone, metadata, domain, text, geo, telegram.
 """
 
 import asyncio
@@ -85,8 +84,10 @@ DEFAULT_HEADERS = {
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
         conn.commit()
@@ -125,10 +126,15 @@ def init_db():
             c.execute("INSERT INTO meta VALUES ('bootstrapped', ?)", (str(now),))
 
 
-def log(event, user_id=None, details="", level="info"):
-    with db() as c:
-        c.execute("INSERT INTO logs(level,event,user_id,details,created_at) VALUES (?,?,?,?,?)",
-                  (level, event, user_id, details[:2000], int(_time.time())))
+def log(event, user_id=None, details="", level="info", conn=None):
+    """Пишет в лог. Если передан conn — использует его, иначе открывает новый."""
+    sql = "INSERT INTO logs(level,event,user_id,details,created_at) VALUES (?,?,?,?,?)"
+    args = (level, event, user_id, details[:2000], int(_time.time()))
+    if conn is not None:
+        conn.execute(sql, args)
+    else:
+        with db() as c:
+            c.execute(sql, args)
 
 
 def get_logs(limit=30, level=None):
@@ -151,7 +157,7 @@ def ensure_user(uid, uname=None, full_name=None):
         else:
             c.execute("INSERT INTO users(user_id,username,full_name,first_seen,last_seen) "
                       "VALUES (?,?,?,?,?)", (uid, uname, full_name, now, now))
-            log("user_registered", uid, f"@{uname}")
+            log("user_registered", uid, f"@{uname}", conn=c)
 
 
 def get_user(uid):
@@ -181,6 +187,7 @@ def log_scan(uid, target, ttype, n):
         c.execute("INSERT INTO scans(user_id,target,target_type,findings_count,created_at) "
                   "VALUES (?,?,?,?,?)", (uid, target, ttype, n, int(_time.time())))
         c.execute("UPDATE users SET total_scans=total_scans+1 WHERE user_id=?", (uid,))
+        log("scan", uid, f"{target[:50]} ({ttype}) findings={n}", conn=c)
 
 
 def user_stats(uid):
@@ -216,7 +223,7 @@ def all_user_ids(only_active=True):
 def set_ban(uid, banned, by):
     with db() as c:
         c.execute("UPDATE users SET is_banned=? WHERE user_id=?", (1 if banned else 0, uid))
-    log("ban" if banned else "unban", uid, f"by {by}", level="warning")
+        log("ban" if banned else "unban", uid, f"by {by}", level="warning", conn=c)
 
 
 def is_banned(uid):
@@ -228,7 +235,7 @@ def is_banned(uid):
 def set_rate_limit(uid, limit, by):
     with db() as c:
         c.execute("UPDATE users SET rate_limit=? WHERE user_id=?", (limit, uid))
-    log("set_rate_limit", uid, f"limit={limit} by {by}")
+        log("set_rate_limit", uid, f"limit={limit} by {by}", conn=c)
 
 
 def get_rate_limit(uid):
@@ -254,7 +261,7 @@ def add_admin(uid, by, role="admin"):
         return False
     with db() as c:
         c.execute("INSERT INTO admins VALUES (?,?,?,?)", (uid, role, by, int(_time.time())))
-    log("admin_granted", uid, f"role={role} by {by}", level="warning")
+        log("admin_granted", uid, f"role={role} by {by}", level="warning", conn=c)
     return True
 
 
@@ -264,7 +271,7 @@ def remove_admin(uid):
     with db() as c:
         cur = c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
         if cur.rowcount:
-            log("admin_revoked", uid, level="warning")
+            log("admin_revoked", uid, level="warning", conn=c)
             return True
     return False
 
@@ -965,7 +972,6 @@ def logs_filter_kb():
 # ═══════════════════════════════════════════════════════════════
 
 def fmt_card(target, ttype, results):
-    """Единая карточка."""
     total = sum(len(r.findings) for r in results)
     duration = sum(r.duration_ms for r in results)
     short_target = target[:60] + ("…" if len(target) > 60 else "")
@@ -1080,7 +1086,6 @@ async def do_scan(msg, target):
         ttype = detect_type(target)
         results = await run_all(target, ttype)
 
-        # телефон — спец-вывод с кнопками
         if ttype == "phone":
             text, links = fmt_phone(results)
             kb = phone_kb(links) if links else result_kb(target)
@@ -1092,7 +1097,6 @@ async def do_scan(msg, target):
 
         total = sum(len(r.findings) for r in results)
         log_scan(uid, target, ttype, total)
-        log("scan", uid, f"{target[:50]} ({ttype}) findings={total}")
     except Exception as e:
         await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
         log("scan_error", uid, str(e), level="error")
@@ -1107,7 +1111,6 @@ async def do_scan(msg, target):
 @router.message(CommandStart())
 async def start(m: Message):
     ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-    log("start", m.from_user.id)
     await m.answer(
         "🕵️ <b>OSINT Bot</b>\n\n"
         "Что умею:\n"
@@ -1209,7 +1212,6 @@ async def handle_file(m: Message):
         await status.edit_text(fmt_metadata(findings), reply_markup=kb,
                                disable_web_page_preview=True)
         log_scan(m.from_user.id, filename, "metadata", len(findings))
-        log("file_uploaded", m.from_user.id, filename)
     except Exception as e:
         await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
         log("file_error", m.from_user.id, str(e), level="error")
