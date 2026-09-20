@@ -1,14 +1,15 @@
 """
-OSINT Bot — всё в одном файле.
-Telegram-бот для OSINT-разведки по открытым источникам.
+OSINT Bot — всё в одном файле + реферальная система.
 """
 
 import asyncio
 import io
 import logging
+import random
 import re
 import socket
 import sqlite3
+import string
 import time as _time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from geopy.geocoders import Nominatim
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     ADMIN_IDS: str = ""
     RATE_LIMIT_PER_HOUR: int = 10
     HTTP_TIMEOUT: int = 15
+    REF_BONUS: int = 5              # 🔹 REF: бонусных сканов за 1 реферала
 
     @property
     def initial_admins(self) -> set:
@@ -101,7 +103,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
             first_seen INTEGER, last_seen INTEGER, total_scans INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT NULL);
+            is_banned INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT NULL,
+            ref_code TEXT UNIQUE,          -- 🔹 REF
+            ref_by INTEGER DEFAULT NULL,   -- 🔹 REF: кто пригласил
+            ref_count INTEGER DEFAULT 0,   -- 🔹 REF: сколько привёл
+            bonus_scans INTEGER DEFAULT 0  -- 🔹 REF: бонусные сканы
+        );
         CREATE TABLE IF NOT EXISTS scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
             target TEXT, target_type TEXT, findings_count INTEGER, created_at INTEGER);
@@ -127,7 +134,6 @@ def init_db():
 
 
 def log(event, user_id=None, details="", level="info", conn=None):
-    """Пишет в лог. Если передан conn — использует его, иначе открывает новый."""
     sql = "INSERT INTO logs(level,event,user_id,details,created_at) VALUES (?,?,?,?,?)"
     args = (level, event, user_id, details[:2000], int(_time.time()))
     if conn is not None:
@@ -135,6 +141,76 @@ def log(event, user_id=None, details="", level="info", conn=None):
     else:
         with db() as c:
             c.execute(sql, args)
+
+
+# 🔹 REF: генерация уникального реф-кода
+def _gen_ref_code(length=8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
+def _unique_ref_code(c) -> str:
+    for _ in range(20):
+        code = _gen_ref_code()
+        if not c.execute("SELECT 1 FROM users WHERE ref_code=?", (code,)).fetchone():
+            return code
+    return _gen_ref_code(12)
+
+
+def ensure_user(uid, uname=None, full_name=None, ref_code=None):
+    """🔹 REF: добавляем параметр ref_code — код того, кто пригласил."""
+    now = int(_time.time())
+    with db() as c:
+        existing = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        if existing:
+            c.execute("UPDATE users SET username=?, full_name=?, last_seen=? WHERE user_id=?",
+                      (uname, full_name, now, uid))
+        else:
+            # генерим свой код
+            my_code = _unique_ref_code(c)
+            # проверяем реф-код пригласившего
+            referrer_id = None
+            if ref_code:
+                row = c.execute("SELECT user_id FROM users WHERE ref_code=?",
+                                (ref_code.upper(),)).fetchone()
+                if row and row["user_id"] != uid:
+                    referrer_id = row["user_id"]
+
+            c.execute("""INSERT INTO users
+                (user_id, username, full_name, first_seen, last_seen,
+                 ref_code, ref_by, ref_count, bonus_scans)
+                VALUES (?,?,?,?,?,?,?,0,0)""",
+                (uid, uname, full_name, now, now, my_code, referrer_id))
+
+            log("user_registered", uid, f"@{uname} ref_by={referrer_id}", conn=c)
+
+            # 🔹 REF: начисляем бонус рефереру
+            if referrer_id:
+                c.execute("""UPDATE users
+                    SET ref_count = ref_count + 1,
+                        bonus_scans = bonus_scans + ?
+                    WHERE user_id=?""", (settings.REF_BONUS, referrer_id))
+                log("ref_bonus", referrer_id,
+                    f"+{settings.REF_BONUS} за реферала {uid}", conn=c)
+
+
+# 🔹 REF: получить инфу о рефералах юзера
+def get_ref_info(uid):
+    with db() as c:
+        r = c.execute("""SELECT ref_code, ref_count, bonus_scans, ref_by
+                         FROM users WHERE user_id=?""", (uid,)).fetchone()
+        if not r:
+            return None
+        return dict(r)
+
+
+# 🔹 REF: топ рефереров
+def top_referrers(limit=10):
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT user_id, username, ref_count, bonus_scans FROM users "
+            "WHERE ref_count > 0 ORDER BY ref_count DESC LIMIT ?",
+            (limit,)).fetchall()]
 
 
 def get_logs(limit=30, level=None):
@@ -146,18 +222,6 @@ def get_logs(limit=30, level=None):
     args.append(limit)
     with db() as c:
         return [dict(r) for r in c.execute(q, args).fetchall()]
-
-
-def ensure_user(uid, uname=None, full_name=None):
-    now = int(_time.time())
-    with db() as c:
-        if c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
-            c.execute("UPDATE users SET username=?, full_name=?, last_seen=? WHERE user_id=?",
-                      (uname, full_name, now, uid))
-        else:
-            c.execute("INSERT INTO users(user_id,username,full_name,first_seen,last_seen) "
-                      "VALUES (?,?,?,?,?)", (uid, uname, full_name, now, now))
-            log("user_registered", uid, f"@{uname}", conn=c)
 
 
 def get_user(uid):
@@ -182,6 +246,17 @@ def count_scans_last_hour(uid):
                          (uid, int(_time.time()) - 3600)).fetchone()["c"]
 
 
+# 🔹 REF: эффективный лимит = базовый + бонусные сканы
+def effective_limit(uid):
+    base = get_rate_limit(uid)
+    with db() as c:
+        r = c.execute("SELECT bonus_scans FROM users WHERE user_id=?", (uid,)).fetchone()
+        bonus = r["bonus_scans"] if r else 0
+    if base == 0:  # 0 = безлимит
+        return 0
+    return base + bonus
+
+
 def log_scan(uid, target, ttype, n):
     with db() as c:
         c.execute("INSERT INTO scans(user_id,target,target_type,findings_count,created_at) "
@@ -204,6 +279,7 @@ def global_stats():
             "day": c.execute("SELECT COUNT(*) c FROM scans WHERE created_at>strftime('%s','now')-86400").fetchone()["c"],
             "banned": c.execute("SELECT COUNT(*) c FROM users WHERE is_banned=1").fetchone()["c"],
             "admins": c.execute("SELECT COUNT(*) c FROM admins").fetchone()["c"],
+            "refs": c.execute("SELECT COALESCE(SUM(ref_count),0) c FROM users").fetchone()["c"],  # 🔹 REF
         }
 
 
@@ -319,8 +395,6 @@ class BaseModule:
         raise NotImplementedError
 
 
-# ─────────── EMAIL ───────────
-
 class EmailModule(BaseModule):
     name = "email_check"
     accepts = {"email"}
@@ -364,8 +438,6 @@ class EmailModule(BaseModule):
                             duration_ms=int((_time.time() - t0) * 1000))
 
 
-# ─────────── USERNAME ───────────
-
 SITES = [
     ("GitHub",   "https://github.com/{u}",           "Not Found"),
     ("Reddit",   "https://www.reddit.com/user/{u}",  "page not found"),
@@ -398,8 +470,6 @@ class UsernameModule(BaseModule):
         return ModuleResult(self.name, target, True, [f for f in raw if f],
                             duration_ms=int((_time.time() - t0) * 1000))
 
-
-# ─────────── PHONE ───────────
 
 PHONE_TYPES_RU = {
     PhoneNumberType.MOBILE: "📱 Мобильный",
@@ -482,8 +552,6 @@ class PhoneModule(BaseModule):
                             duration_ms=int((_time.time() - t0) * 1000))
 
 
-# ─────────── TELEGRAM ───────────
-
 class TelegramModule(BaseModule):
     name = "telegram_check"
     accepts = {"phone"}
@@ -527,8 +595,6 @@ class TelegramModule(BaseModule):
         return ModuleResult(self.name, target, True, findings,
                             duration_ms=int((_time.time() - t0) * 1000))
 
-
-# ─────────── METADATA ───────────
 
 TAG_RU = {
     "Make": "Производитель", "Model": "Модель устройства", "Software": "Софт",
@@ -638,8 +704,6 @@ class MetadataModule(BaseModule):
         return findings
 
 
-# ─────────── DOMAIN ───────────
-
 class DomainModule(BaseModule):
     name = "domain_check"
     accepts = set()
@@ -705,8 +769,6 @@ class DomainModule(BaseModule):
                             duration_ms=int((_time.time() - t0) * 1000))
 
 
-# ─────────── TEXT ───────────
-
 TEXT_EMAIL_RE = re.compile(r"[\w\.\-\+]+@[\w\-]+\.[\w\.\-]+")
 TEXT_PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{8,}\d")
 TEXT_URL_RE = re.compile(r"https?://[^\s]+")
@@ -750,8 +812,6 @@ class TextModule(BaseModule):
         return ModuleResult(cls.name, target, True, findings,
                             duration_ms=int((_time.time() - t0) * 1000))
 
-
-# ─────────── GEO ───────────
 
 class GeoModule(BaseModule):
     name = "geo_search"
@@ -812,8 +872,6 @@ class GeoModule(BaseModule):
         return ModuleResult(cls.name, target, True, findings,
                             duration_ms=int((_time.time() - t0) * 1000))
 
-
-# ─────────── IMAGE HOSTING ───────────
 
 async def upload_to_host(image_bytes, filename="img.jpg"):
     try:
@@ -912,7 +970,8 @@ def main_kb(uid=None):
         [KeyboardButton(text="🔍 Сканировать"), KeyboardButton(text="📷 По фото")],
         [KeyboardButton(text="🌐 Домен"), KeyboardButton(text="🗺 Гео")],
         [KeyboardButton(text="📝 Текст"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🎁 Рефералы"), KeyboardButton(text="📊 Статистика")],  # 🔹 REF
+        [KeyboardButton(text="❓ Помощь")],
     ]
     if uid and is_admin(uid):
         rows.append([KeyboardButton(text="🛠 Админка")])
@@ -943,12 +1002,23 @@ def photo_kb():
     ])
 
 
+# 🔹 REF: клавиатура для рефералов
+def ref_kb(bot_username: str, ref_code: str):
+    link = f"https://t.me/{bot_username}?start=ref_{ref_code}"
+    share = f"https://t.me/share/url?url={quote(link)}&text={quote('Попробуй этого OSINT-бота 👇')}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться", url=share)],
+        [InlineKeyboardButton(text="🔁 Обновить", callback_data="ref:refresh")],
+    ])
+
+
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="a:stats"),
          InlineKeyboardButton(text="📜 Логи", callback_data="a:logs")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="a:admins"),
          InlineKeyboardButton(text="🏆 Топ", callback_data="a:top")],
+        [InlineKeyboardButton(text="🎁 Топ рефереров", callback_data="a:topref")],  # 🔹 REF
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="a:broadcast")],
         [InlineKeyboardButton(text="🚫 Бан", callback_data="a:ban"),
          InlineKeyboardButton(text="✅ Разбан", callback_data="a:unban")],
@@ -1061,6 +1131,21 @@ def fmt_metadata(findings):
     return "\n".join(lines)
 
 
+# 🔹 REF: карточка рефералов
+def fmt_ref(uid, bot_username, stats):
+    link = f"https://t.me/{bot_username}?start=ref_{stats['ref_code']}"
+    return (
+        "🎁 <b>Реферальная система</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔑 <b>Твой код:</b> <code>{stats['ref_code']}</code>\n"
+        f"🔗 <b>Твоя ссылка:</b>\n<code>{link}</code>\n\n"
+        f"👥 <b>Приглашено:</b> {stats['ref_count']}\n"
+        f"⚡️ <b>Бонусных сканов:</b> {stats['bonus_scans']}\n\n"
+        "📌 <i>За каждого друга — +5 сканов сверх лимита.</i>\n"
+        "Поделись ссылкой 👇"
+    ), link
+
+
 # ═══════════════════════════════════════════════════════════════
 #                        SCAN
 # ═══════════════════════════════════════════════════════════════
@@ -1070,9 +1155,9 @@ async def do_scan(msg, target):
     if is_banned(uid):
         await msg.answer("🚫 Ты забанен.")
         return
-    limit = get_rate_limit(uid)
+    limit = effective_limit(uid)  # 🔹 REF: учитываем бонусные
     if limit > 0 and count_scans_last_hour(uid) >= limit:
-        await msg.answer(f"⛔ Лимит {limit}/час.")
+        await msg.answer(f"⛔ Лимит {limit}/час.\n💡 Пригласи друзей через /ref — получишь +5 сканов за каждого.")
         return
     if uid in _running:
         await msg.answer("⏳ Уже идёт скан.")
@@ -1108,6 +1193,32 @@ async def do_scan(msg, target):
 #                        HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
+# 🔹 REF: /start принимает deep-link payload
+@router.message(CommandStart(deep_link=True))
+async def start_ref(m: Message, command: CommandObject):
+    payload = command.args or ""
+    ref_code = None
+    if payload.startswith("ref_"):
+        ref_code = payload[4:].upper()
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name, ref_code)
+
+    me = await m.bot.get_me()
+    stats = get_ref_info(m.from_user.id) or {}
+    text = (
+        "🕵️ <b>OSINT Bot</b>\n\n"
+        "Что умею:\n"
+        "▫️ <b>Email / username / телефон</b> — пробив\n"
+        "▫️ <b>Фото</b> — метаданные + поиск\n"
+        "▫️ <b>Домен</b> — WHOIS, IP, поддомены\n"
+        "▫️ <b>Координаты</b> — адрес + что рядом\n"
+        "▫️ <b>Текст</b> — email/телефоны/ссылки\n\n"
+        "Просто напиши цель 👇"
+    )
+    if ref_code and stats.get("ref_by"):
+        text = "✅ <b>Ты пришёл по приглашению!</b>\n\n" + text
+    await m.answer(text, reply_markup=main_kb(m.from_user.id))
+
+
 @router.message(CommandStart())
 async def start(m: Message):
     ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
@@ -1133,9 +1244,40 @@ async def help_cmd(m: Message):
         "▫️ Фото — метаданные + поиск\n"
         "▫️ <code>example.com</code> — WHOIS\n"
         "▫️ <code>55.7558, 37.6173</code> — гео\n\n"
-        "Команды: /scan /me /admin",
+        "Команды: /scan /ref /me /admin",
         reply_markup=main_kb(m.from_user.id),
     )
+
+
+# 🔹 REF: команда /ref + кнопка
+@router.message(Command("ref"))
+@router.message(F.text == "🎁 Рефералы")
+async def ref_cmd(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    stats = get_ref_info(m.from_user.id)
+    if not stats:
+        await m.answer("❌ Профиль не найден. Напиши /start.")
+        return
+    me = await m.bot.get_me()
+    text, link = fmt_ref(m.from_user.id, me.username, stats)
+    await m.answer(text, reply_markup=ref_kb(me.username, stats["ref_code"]),
+                   disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "ref:refresh")
+async def cb_ref_refresh(cb: CallbackQuery):
+    stats = get_ref_info(cb.from_user.id)
+    if not stats:
+        return await cb.answer("Напиши /start", show_alert=True)
+    me = await cb.bot.get_me()
+    text, _ = fmt_ref(cb.from_user.id, me.username, stats)
+    try:
+        await cb.message.edit_text(text,
+                                   reply_markup=ref_kb(me.username, stats["ref_code"]),
+                                   disable_web_page_preview=True)
+    except Exception:
+        pass
+    await cb.answer("Обновлено")
 
 
 @router.message(F.text == "👤 Профиль")
@@ -1143,10 +1285,14 @@ async def help_cmd(m: Message):
 async def me(m: Message):
     s = user_stats(m.from_user.id)
     ts = datetime.fromtimestamp(s["first_seen"]).strftime("%Y-%m-%d") if s.get("first_seen") else "—"
+    lim = effective_limit(m.from_user.id)
     await m.answer(
         f"👤 <b>{m.from_user.full_name}</b>\n"
         f"🆔 <code>{m.from_user.id}</code>\n"
         f"📊 Сканов: <b>{s['total_scans']}</b>\n"
+        f"⚙️ Лимит/час: <b>{lim or '∞'}</b>\n"
+        f"👥 Рефералов: <b>{s.get('ref_count', 0)}</b>\n"
+        f"⚡️ Бонус: <b>+{s.get('bonus_scans', 0)}</b>\n"
         f"📅 С нами с: {ts}",
         reply_markup=main_kb(m.from_user.id),
     )
@@ -1357,8 +1503,26 @@ async def cb_stats(cb: CallbackQuery):
         f"🛡 Админов: <b>{g['admins']}</b>\n"
         f"🚫 Бан: <b>{g['banned']}</b>\n"
         f"🔎 Сканов: <b>{g['scans']}</b>\n"
-        f"📅 За 24ч: <b>{g['day']}</b>",
+        f"📅 За 24ч: <b>{g['day']}</b>\n"
+        f"🎁 Рефералов: <b>{g['refs']}</b>",
         reply_markup=admin_kb())
+    await cb.answer()
+
+
+# 🔹 REF: топ рефереров в админке
+@router.callback_query(F.data == "a:topref")
+async def cb_top_ref(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    rows = top_referrers(10)
+    lines = ["🎁 <b>Топ-10 рефереров</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("Пока никого.")
+    for i, u in enumerate(rows, 1):
+        un = f"@{u['username']}" if u["username"] else "—"
+        lines.append(f"{i}. <code>{u['user_id']}</code> {un} — "
+                     f"<b>{u['ref_count']}</b> реф. (⚡️{u['bonus_scans']})")
+    await cb.message.edit_text("\n".join(lines), reply_markup=admin_kb())
     await cb.answer()
 
 
@@ -1396,7 +1560,7 @@ async def cb_top(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Нет доступа", show_alert=True)
     rows = top_users(10)
-    lines = ["🏆 <b>Топ-10</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["🏆 <b>Топ-10 юзеров</b>", "━━━━━━━━━━━━━━━━━━━━"]
     for i, u in enumerate(rows, 1):
         un = f"@{u['username']}" if u["username"] else "—"
         lines.append(f"{i}. <code>{u['user_id']}</code> {un} — <b>{u['total_scans']}</b>")
@@ -1601,6 +1765,9 @@ async def process_find(m: Message, state: FSMContext):
         f"📛 {u['full_name'] or '—'}\n"
         f"🔎 Сканов: <b>{u['total_scans']}</b>\n"
         f"⚙️ Лимит/час: <b>{lim}</b>\n"
+        f"👥 Рефералов: <b>{u.get('ref_count', 0)}</b>\n"
+        f"⚡️ Бонус: <b>+{u.get('bonus_scans', 0)}</b>\n"
+        f"🔑 Код: <code>{u.get('ref_code', '—')}</code>\n"
         f"🚫 Бан: <b>{'да' if u['is_banned'] else 'нет'}</b>\n"
         f"🛡 Админ: <b>{'да' if is_admin(u['user_id']) else 'нет'}</b>\n"
         f"📅 Первый: {ts1}\n🕒 Последний: {ts2}",
