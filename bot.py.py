@@ -1,0 +1,1632 @@
+"""
+OSINT Bot — всё в одном файле.
+Telegram-бот для OSINT-разведки по открытым источникам.
+Модули: email, username, phone, metadata, domain, text, geo, telegram.
+"""
+
+import asyncio
+import io
+import logging
+import re
+import socket
+import sqlite3
+import time as _time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import exifread
+import httpx
+import phonenumbers
+import whois21
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+from phonenumbers import geocoder, carrier, timezone, number_type, PhoneNumberType
+from geopy.geocoders import Nominatim
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery, BufferedInputFile,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    BOT_TOKEN: str
+    OWNER_ID: int = 0
+    ADMIN_IDS: str = ""
+    RATE_LIMIT_PER_HOUR: int = 10
+    HTTP_TIMEOUT: int = 15
+
+    @property
+    def initial_admins(self) -> set:
+        ids = {int(x) for x in self.ADMIN_IDS.split(",") if x.strip().isdigit()}
+        if self.OWNER_ID:
+            ids.add(self.OWNER_ID)
+        return ids
+
+    @property
+    def db_path(self) -> Path:
+        if Path("/data").exists():
+            return Path("/data/osint.db")
+        return Path(__file__).parent / "osint.db"
+
+
+settings = Settings()
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        STORAGE
+# ═══════════════════════════════════════════════════════════════
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
+            first_seen INTEGER, last_seen INTEGER, total_scans INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT NULL);
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+            target TEXT, target_type TEXT, findings_count INTEGER, created_at INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_scans_ut ON scans(user_id, created_at);
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY, role TEXT DEFAULT 'admin',
+            granted_by INTEGER, granted_at INTEGER);
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT DEFAULT 'info',
+            event TEXT, user_id INTEGER, details TEXT, created_at INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_logs_time ON logs(created_at DESC);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+        """)
+
+    with db() as c:
+        if not c.execute("SELECT 1 FROM meta WHERE key='bootstrapped'").fetchone():
+            now = int(_time.time())
+            for aid in settings.initial_admins:
+                role = "owner" if aid == settings.OWNER_ID else "admin"
+                c.execute("INSERT OR IGNORE INTO admins VALUES (?,?,?,?)",
+                          (aid, role, aid, now))
+            c.execute("INSERT INTO meta VALUES ('bootstrapped', ?)", (str(now),))
+
+
+def log(event, user_id=None, details="", level="info"):
+    with db() as c:
+        c.execute("INSERT INTO logs(level,event,user_id,details,created_at) VALUES (?,?,?,?,?)",
+                  (level, event, user_id, details[:2000], int(_time.time())))
+
+
+def get_logs(limit=30, level=None):
+    q, args = "SELECT * FROM logs WHERE 1=1", []
+    if level:
+        q += " AND level=?"
+        args.append(level)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with db() as c:
+        return [dict(r) for r in c.execute(q, args).fetchall()]
+
+
+def ensure_user(uid, uname=None, full_name=None):
+    now = int(_time.time())
+    with db() as c:
+        if c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+            c.execute("UPDATE users SET username=?, full_name=?, last_seen=? WHERE user_id=?",
+                      (uname, full_name, now, uid))
+        else:
+            c.execute("INSERT INTO users(user_id,username,full_name,first_seen,last_seen) "
+                      "VALUES (?,?,?,?,?)", (uid, uname, full_name, now, now))
+            log("user_registered", uid, f"@{uname}")
+
+
+def get_user(uid):
+    with db() as c:
+        r = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        return dict(r) if r else None
+
+
+def find_user(query):
+    q = query.strip().lstrip("@")
+    with db() as c:
+        if q.isdigit():
+            r = c.execute("SELECT * FROM users WHERE user_id=?", (int(q),)).fetchone()
+        else:
+            r = c.execute("SELECT * FROM users WHERE username=?", (q,)).fetchone()
+        return dict(r) if r else None
+
+
+def count_scans_last_hour(uid):
+    with db() as c:
+        return c.execute("SELECT COUNT(*) c FROM scans WHERE user_id=? AND created_at>?",
+                         (uid, int(_time.time()) - 3600)).fetchone()["c"]
+
+
+def log_scan(uid, target, ttype, n):
+    with db() as c:
+        c.execute("INSERT INTO scans(user_id,target,target_type,findings_count,created_at) "
+                  "VALUES (?,?,?,?,?)", (uid, target, ttype, n, int(_time.time())))
+        c.execute("UPDATE users SET total_scans=total_scans+1 WHERE user_id=?", (uid,))
+
+
+def user_stats(uid):
+    with db() as c:
+        r = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        return dict(r) if r else {"total_scans": 0, "first_seen": None}
+
+
+def global_stats():
+    with db() as c:
+        return {
+            "users": c.execute("SELECT COUNT(*) c FROM users").fetchone()["c"],
+            "scans": c.execute("SELECT COUNT(*) c FROM scans").fetchone()["c"],
+            "day": c.execute("SELECT COUNT(*) c FROM scans WHERE created_at>strftime('%s','now')-86400").fetchone()["c"],
+            "banned": c.execute("SELECT COUNT(*) c FROM users WHERE is_banned=1").fetchone()["c"],
+            "admins": c.execute("SELECT COUNT(*) c FROM admins").fetchone()["c"],
+        }
+
+
+def top_users(limit=10):
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT user_id, username, total_scans FROM users ORDER BY total_scans DESC LIMIT ?",
+            (limit,)).fetchall()]
+
+
+def all_user_ids(only_active=True):
+    q = "SELECT user_id FROM users" + (" WHERE is_banned=0" if only_active else "")
+    with db() as c:
+        return [r["user_id"] for r in c.execute(q).fetchall()]
+
+
+def set_ban(uid, banned, by):
+    with db() as c:
+        c.execute("UPDATE users SET is_banned=? WHERE user_id=?", (1 if banned else 0, uid))
+    log("ban" if banned else "unban", uid, f"by {by}", level="warning")
+
+
+def is_banned(uid):
+    with db() as c:
+        r = c.execute("SELECT is_banned FROM users WHERE user_id=?", (uid,)).fetchone()
+        return bool(r and r["is_banned"])
+
+
+def set_rate_limit(uid, limit, by):
+    with db() as c:
+        c.execute("UPDATE users SET rate_limit=? WHERE user_id=?", (limit, uid))
+    log("set_rate_limit", uid, f"limit={limit} by {by}")
+
+
+def get_rate_limit(uid):
+    with db() as c:
+        r = c.execute("SELECT rate_limit FROM users WHERE user_id=?", (uid,)).fetchone()
+        return (r["rate_limit"] if r and r["rate_limit"] is not None
+                else settings.RATE_LIMIT_PER_HOUR)
+
+
+def is_admin(uid):
+    with db() as c:
+        return c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
+
+
+def is_owner(uid):
+    with db() as c:
+        r = c.execute("SELECT role FROM admins WHERE user_id=?", (uid,)).fetchone()
+        return bool(r and r["role"] == "owner")
+
+
+def add_admin(uid, by, role="admin"):
+    if is_admin(uid):
+        return False
+    with db() as c:
+        c.execute("INSERT INTO admins VALUES (?,?,?,?)", (uid, role, by, int(_time.time())))
+    log("admin_granted", uid, f"role={role} by {by}", level="warning")
+    return True
+
+
+def remove_admin(uid):
+    if is_owner(uid):
+        return False
+    with db() as c:
+        cur = c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        if cur.rowcount:
+            log("admin_revoked", uid, level="warning")
+            return True
+    return False
+
+
+def list_admins():
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT a.user_id, a.role, u.username FROM admins a "
+            "LEFT JOIN users u ON u.user_id=a.user_id ORDER BY a.role DESC"
+        ).fetchall()]
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        MODELS
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Finding:
+    source: str
+    category: str
+    target: str
+    data: dict = field(default_factory=dict)
+    confidence: float = 1.0
+
+
+@dataclass
+class ModuleResult:
+    module_name: str
+    target: str
+    success: bool
+    findings: list = field(default_factory=list)
+    error: str = None
+    duration_ms: int = 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        MODULES
+# ═══════════════════════════════════════════════════════════════
+
+class BaseModule:
+    name = "base"
+    accepts: set = set()
+
+    async def run(self, target, client):
+        raise NotImplementedError
+
+
+# ─────────── EMAIL ───────────
+
+class EmailModule(BaseModule):
+    name = "email_check"
+    accepts = {"email"}
+
+    SERVICES = [
+        {"name": "Pinterest",
+         "url": "https://www.pinterest.com/resource/EmailExistsResource/get/",
+         "method": "GET",
+         "params": {"source_url": "/", "data": '{"options":{"email":"{t}"}}'},
+         "check": lambda r: r.status_code == 200 and '"exists": true' in r.text.lower()},
+        {"name": "Adobe",
+         "url": "https://auth.services.adobe.com/signin/v2/users/accounts",
+         "method": "POST", "json": {"username": "{t}"},
+         "check": lambda r: r.status_code == 200 and "account" in r.text.lower()},
+        {"name": "Spotify",
+         "url": "https://www.spotify.com/api/signup/validate",
+         "method": "POST", "json": {"email": "{t}", "validate": "1"},
+         "check": lambda r: r.status_code == 200 and "exists" in r.text.lower()},
+    ]
+
+    async def _one(self, client, svc, target):
+        try:
+            if svc["method"] == "POST":
+                body = {k: (v.format(t=target) if isinstance(v, str) else v)
+                        for k, v in svc.get("json", {}).items()}
+                r = await client.post(svc["url"], json=body)
+            else:
+                params = {k: (v.format(t=target) if isinstance(v, str) else v)
+                          for k, v in svc.get("params", {}).items()}
+                r = await client.get(svc["url"], params=params)
+            if svc["check"](r):
+                return Finding(svc["name"], "email", target, {"registered": True}, 0.8)
+        except Exception:
+            return None
+        return None
+
+    async def run(self, target, client):
+        t0 = _time.time()
+        raw = await asyncio.gather(*[self._one(client, s, target) for s in self.SERVICES])
+        return ModuleResult(self.name, target, True, [f for f in raw if f],
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── USERNAME ───────────
+
+SITES = [
+    ("GitHub",   "https://github.com/{u}",           "Not Found"),
+    ("Reddit",   "https://www.reddit.com/user/{u}",  "page not found"),
+    ("Telegram", "https://t.me/{u}",                 None),
+    ("VK",       "https://vk.com/{u}",               None),
+    ("Habr",     "https://habr.com/ru/users/{u}/",   "Страница не найдена"),
+    ("Pikabu",   "https://pikabu.ru/@{u}",           None),
+    ("TikTok",   "https://www.tiktok.com/@{u}",      "Couldn't find this account"),
+]
+
+
+class UsernameModule(BaseModule):
+    name = "username_check"
+    accepts = {"username"}
+
+    async def _one(self, client, site, u):
+        name, tmpl, miss = site
+        url = tmpl.format(u=u)
+        try:
+            r = await client.get(url)
+            if r.status_code == 200 and not (miss and miss.lower() in r.text.lower()):
+                return Finding(name, "username", u, {"url": url}, 0.75)
+        except Exception:
+            return None
+        return None
+
+    async def run(self, target, client):
+        t0 = _time.time()
+        raw = await asyncio.gather(*[self._one(client, s, target) for s in SITES])
+        return ModuleResult(self.name, target, True, [f for f in raw if f],
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── PHONE ───────────
+
+PHONE_TYPES_RU = {
+    PhoneNumberType.MOBILE: "📱 Мобильный",
+    PhoneNumberType.FIXED_LINE: "☎️ Городской",
+    PhoneNumberType.FIXED_LINE_OR_MOBILE: "📞 Фиксированный/мобильный",
+    PhoneNumberType.TOLL_FREE: "🆓 Бесплатный (800)",
+    PhoneNumberType.PREMIUM_RATE: "💰 Премиум",
+    PhoneNumberType.VOIP: "🌐 VoIP",
+    PhoneNumberType.PERSONAL_NUMBER: "👤 Персональный",
+    PhoneNumberType.PAGER: "📟 Пейджер",
+    PhoneNumberType.UAN: "🏢 UAN",
+    PhoneNumberType.VOICEMAIL: "📼 Голосовая почта",
+    PhoneNumberType.UNKNOWN: "❓ Неизвестно",
+}
+
+
+class PhoneModule(BaseModule):
+    name = "phone_check"
+    accepts = {"phone"}
+
+    @staticmethod
+    def _normalize(raw):
+        raw = raw.strip()
+        plus = raw.startswith("+")
+        digits = "".join(c for c in raw if c.isdigit())
+        return ("+" if plus else "") + digits
+
+    @staticmethod
+    def _links(e164):
+        d = e164.lstrip("+")
+        return {
+            "WhatsApp": f"https://wa.me/{d}",
+            "Telegram": f"https://t.me/+{d}",
+            "Truecaller": f"https://www.truecaller.com/search/{d}",
+            "Sync.me": f"https://sync.me/search/?number={d}",
+            "Google": f"https://www.google.com/search?q={quote(e164)}",
+            "Yandex": f"https://yandex.ru/search/?text={quote(e164)}",
+        }
+
+    async def run(self, target, client):
+        t0 = _time.time()
+        raw = self._normalize(target)
+        parse_target = raw if raw.startswith("+") else "+" + raw
+
+        try:
+            num = phonenumbers.parse(parse_target, None)
+        except phonenumbers.NumberParseException as e:
+            return ModuleResult(self.name, target, False,
+                                error=f"Не распарсить: {e}",
+                                duration_ms=int((_time.time() - t0) * 1000))
+
+        if not phonenumbers.is_possible_number(num):
+            return ModuleResult(self.name, target, False, error="Номер невозможен",
+                                duration_ms=int((_time.time() - t0) * 1000))
+
+        e164 = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+        intl = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+        national = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.NATIONAL)
+        valid = phonenumbers.is_valid_number(num)
+
+        tech = {
+            "E.164": e164,
+            "Международный": intl,
+            "Национальный": national,
+            "Код страны": f"+{num.country_code}",
+            "Регион": geocoder.description_for_number(num, "ru") or "—",
+            "Оператор": carrier.name_for_number(num, "ru") or "—",
+            "Тип линии": PHONE_TYPES_RU.get(number_type(num), "❓"),
+            "Валидный": "✅ да" if valid else "❌ нет",
+        }
+        tz = timezone.time_zones_for_number(num)
+        if tz:
+            tech["Часовые пояса"] = ", ".join(tz)
+
+        findings = [
+            Finding("Технические данные", "phone", e164, tech, 1.0 if valid else 0.4),
+            Finding("Ссылки для проверки", "phone", e164, {"Ссылки": self._links(e164)}, 1.0),
+        ]
+        return ModuleResult(self.name, target, True, findings,
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── TELEGRAM ───────────
+
+class TelegramModule(BaseModule):
+    name = "telegram_check"
+    accepts = {"phone"}
+
+    async def _check_number(self, phone, client):
+        digits = phone.lstrip("+")
+        url = f"https://t.me/+{digits}"
+        try:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return None
+            html = r.text
+            result = {}
+            for tag in ["og:title", "og:description", "og:image"]:
+                m = re.search(rf'<meta property="{tag}" content="([^"]+)"', html)
+                if m:
+                    result[tag] = m.group(1)
+            if "og:title" not in result:
+                return None
+            return {
+                "Статус": "✅ найден",
+                "Имя": result.get("og:title", "—"),
+                "Био": result.get("og:description", "—"),
+                "Фото": result.get("og:image", "—"),
+                "Ссылка": url,
+            }
+        except Exception:
+            return None
+
+    async def run(self, target, client):
+        t0 = _time.time()
+        raw = PhoneModule._normalize(target)
+        e164 = raw if raw.startswith("+") else "+" + raw
+        findings = []
+        info = await self._check_number(e164, client)
+        if info:
+            findings.append(Finding("Telegram", "telegram", e164, info, 0.9))
+        else:
+            findings.append(Finding("Telegram", "telegram", e164,
+                                    {"Статус": "❌ не найден или скрыт"}, 0.5))
+        return ModuleResult(self.name, target, True, findings,
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── METADATA ───────────
+
+TAG_RU = {
+    "Make": "Производитель", "Model": "Модель устройства", "Software": "Софт",
+    "DateTime": "Дата съёмки", "DateTimeOriginal": "Оригинальная дата",
+    "ExposureTime": "Выдержка", "FNumber": "Диафрагма", "ISOSpeedRatings": "ISO",
+    "FocalLength": "Фокусное расстояние", "Flash": "Вспышка",
+    "LensModel": "Объектив", "Artist": "Автор", "Copyright": "Копирайт",
+    "ImageDescription": "Описание",
+}
+
+FLASH_RU = {0x0: "не сработала", 0x1: "сработала", 0x5: "сработала без возврата",
+            0x7: "сработала с возвратом", 0x9: "принудительно",
+            0x10: "выключена", 0x18: "авто, не сработала", 0x19: "авто, сработала"}
+
+
+def _dms_to_deg(dms, ref):
+    d, m, s = (float(x.num) / float(x.den) if hasattr(x, "num") else float(x) for x in dms)
+    val = d + m / 60 + s / 3600
+    return -val if ref in ("S", "W") else val
+
+
+def _extract_gps(img):
+    try:
+        exif = img._getexif()
+        if not exif:
+            return None
+        gps = {}
+        for k, v in exif.items():
+            if TAGS.get(k) == "GPSInfo":
+                for gk, gv in v.items():
+                    gps[GPSTAGS.get(gk, gk)] = gv
+        if not gps:
+            return None
+        lat = _dms_to_deg(gps["GPSLatitude"], gps.get("GPSLatitudeRef", "N"))
+        lon = _dms_to_deg(gps["GPSLongitude"], gps.get("GPSLongitudeRef", "E"))
+        return lat, lon
+    except Exception:
+        return None
+
+
+def _reverse_geocode(lat, lon):
+    try:
+        geo = Nominatim(user_agent="osint_bot")
+        loc = geo.reverse(f"{lat}, {lon}", language="ru", timeout=5)
+        return loc.address if loc else "не определён"
+    except Exception:
+        return "геокодер недоступен"
+
+
+class MetadataModule(BaseModule):
+    name = "metadata"
+
+    @staticmethod
+    def analyze(file_bytes, filename):
+        findings = []
+        human = {}
+
+        try:
+            tags = exifread.process_file(io.BytesIO(file_bytes), details=False)
+            for tag, val in tags.items():
+                if tag in ("JPEGThumbnail", "TIFFThumbnail", "Filename", "EXIF MakerNote"):
+                    continue
+                short = tag.split(" ", 1)[-1]
+                label = TAG_RU.get(short, short)
+                sval = str(val).strip()
+                if sval and len(sval) < 200:
+                    human[label] = sval
+        except Exception:
+            pass
+
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            human["Формат"] = img.format or "?"
+            human["Размер"] = f"{img.width}×{img.height}"
+            human["Цветовой режим"] = img.mode
+            gps = _extract_gps(img)
+            if gps:
+                lat, lon = gps
+                human["GPS координаты"] = f"{lat:.6f}, {lon:.6f}"
+                human["Google Maps"] = f"https://maps.google.com/?q={lat},{lon}"
+                human["Адрес (reverse)"] = _reverse_geocode(lat, lon)
+            exif = img._getexif() or {}
+            for k, v in exif.items():
+                if TAGS.get(k) == "Flash":
+                    human["Вспышка"] = FLASH_RU.get(v, str(v))
+        except Exception:
+            pass
+
+        if human:
+            findings.append(Finding(f"Файл: {filename}", "metadata", filename, human, 1.0))
+
+        warns = []
+        if "GPS координаты" in human:
+            warns.append("📍 GPS — место съёмки раскрыто")
+        if "Модель устройства" in human:
+            dev = f"{human.get('Производитель','')} {human.get('Модель устройства','')}".strip()
+            warns.append(f"📷 Устройство: {dev}")
+        if "Оригинальная дата" in human or "Дата съёмки" in human:
+            warns.append(f"🕒 Дата: {human.get('Оригинальная дата') or human.get('Дата съёмки')}")
+        if "Software" in human:
+            warns.append(f"💻 Обработано в: {human['Software']}")
+        if "Автор" in human:
+            warns.append(f"✍️ Автор: {human['Автор']}")
+        if warns:
+            findings.append(Finding("Ключевые следы", "metadata", filename,
+                                    {"Следы": "\n".join(warns)}, 1.0))
+        return findings
+
+
+# ─────────── DOMAIN ───────────
+
+class DomainModule(BaseModule):
+    name = "domain_check"
+    accepts = set()
+
+    @staticmethod
+    async def _get_subdomains(domain):
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get("https://crt.sh/",
+                                params={"q": f"%.{domain}", "output": "json"},
+                                headers={"User-Agent": "osint-bot/1.0"})
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+                subs = set()
+                for entry in data:
+                    for name in entry.get("name_value", "").split("\n"):
+                        name = name.strip().lower()
+                        if name.endswith(domain) and "*" not in name:
+                            subs.add(name)
+                return sorted(subs)[:50]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _get_ip(domain):
+        try:
+            return socket.gethostbyname(domain)
+        except Exception:
+            return None
+
+    @classmethod
+    async def run(cls, target, client):
+        t0 = _time.time()
+        findings = []
+        domain = target.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+
+        try:
+            w = whois21.WHOIS(domain)
+            if w.success:
+                wd = w.whois_data or {}
+                info = {
+                    "Домен": domain,
+                    "Регистратор": str(wd.get("registrar", "—")),
+                    "Дата регистрации": str(wd.get("creation_date", "—"))[:19],
+                    "Дата истечения": str(wd.get("expiration_date", "—"))[:19],
+                    "NS": ", ".join(wd.get("name_servers", [])[:5]) if wd.get("name_servers") else "—",
+                }
+                findings.append(Finding("WHOIS", "domain", domain, info, 1.0))
+        except Exception as e:
+            findings.append(Finding("WHOIS", "domain", domain, {"error": str(e)}, 0.0))
+
+        ip = cls._get_ip(domain)
+        if ip:
+            findings.append(Finding("IP", "domain", domain, {"IP": ip}, 0.9))
+
+        subs = await cls._get_subdomains(domain)
+        if subs:
+            findings.append(Finding("Поддомены", "domain", domain,
+                                    {"Найдено": str(len(subs)), "Список": "\n".join(subs[:20])}, 0.8))
+
+        return ModuleResult(cls.name, target, True, findings,
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── TEXT ───────────
+
+TEXT_EMAIL_RE = re.compile(r"[\w\.\-\+]+@[\w\-]+\.[\w\.\-]+")
+TEXT_PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{8,}\d")
+TEXT_URL_RE = re.compile(r"https?://[^\s]+")
+TEXT_MENTION_RE = re.compile(r"@[\w_]{3,32}")
+TEXT_COORD_RE = re.compile(r"(-?\d{1,3}\.\d{3,})\s*[,;]\s*(-?\d{1,3}\.\d{3,})")
+
+
+class TextModule(BaseModule):
+    name = "text_analysis"
+    accepts = set()
+
+    @classmethod
+    async def run(cls, target, client):
+        t0 = _time.time()
+        text = target
+
+        emails = list(set(TEXT_EMAIL_RE.findall(text)))
+        phones = list(set(TEXT_PHONE_RE.findall(text)))
+        urls = list(set(TEXT_URL_RE.findall(text)))
+        mentions = list(set(TEXT_MENTION_RE.findall(text)))
+        coords = list(set(TEXT_COORD_RE.findall(text)))
+
+        findings = []
+        if emails:
+            findings.append(Finding("Email", "text", target,
+                                    {"Найдено": str(len(emails)), "Список": "\n".join(emails[:10])}, 0.9))
+        if phones:
+            findings.append(Finding("Телефоны", "text", target,
+                                    {"Найдено": str(len(phones)), "Список": "\n".join(phones[:10])}, 0.8))
+        if urls:
+            findings.append(Finding("Ссылки", "text", target,
+                                    {"Найдено": str(len(urls)), "Список": "\n".join(urls[:10])}, 0.9))
+        if mentions:
+            findings.append(Finding("Упоминания", "text", target,
+                                    {"Найдено": str(len(mentions)), "Список": "\n".join(mentions[:10])}, 0.7))
+        if coords:
+            findings.append(Finding("Координаты", "text", target,
+                                    {"Найдено": str(len(coords)),
+                                     "Список": "\n".join(f"{a}, {b}" for a, b in coords)}, 0.9))
+
+        return ModuleResult(cls.name, target, True, findings,
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── GEO ───────────
+
+class GeoModule(BaseModule):
+    name = "geo_search"
+    accepts = set()
+
+    @staticmethod
+    async def _nearby_pois(lat, lon, radius=500):
+        query = f"""
+        [out:json][timeout:25];
+        (
+          node["amenity"](around:{radius},{lat},{lon});
+          node["shop"](around:{radius},{lat},{lon});
+          node["tourism"](around:{radius},{lat},{lon});
+        );
+        out body 30;
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post("https://overpass-api.de/api/interpreter", data=query)
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+                pois = []
+                for el in data.get("elements", [])[:20]:
+                    tags = el.get("tags", {})
+                    pois.append({
+                        "name": tags.get("name", "—"),
+                        "type": tags.get("amenity") or tags.get("shop") or tags.get("tourism", "—"),
+                    })
+                return pois
+        except Exception:
+            return []
+
+    @classmethod
+    async def run(cls, target, client):
+        t0 = _time.time()
+        m = re.match(r"^(-?\d{1,3}\.\d{3,})\s*[,;]\s*(-?\d{1,3}\.\d{3,})$", target.strip())
+        if not m:
+            return ModuleResult(cls.name, target, False,
+                                error="Нужны координаты вида '55.7558, 37.6173'")
+
+        lat, lon = float(m.group(1)), float(m.group(2))
+        findings = []
+
+        address = _reverse_geocode(lat, lon)
+        findings.append(Finding("Адрес", "geo", target, {
+            "Координаты": f"{lat}, {lon}",
+            "Адрес": address,
+            "Google Maps": f"https://maps.google.com/?q={lat},{lon}",
+        }, 0.9))
+
+        pois = await cls._nearby_pois(lat, lon)
+        if pois:
+            lines = [f"• {p['name']} ({p['type']})" for p in pois[:15]]
+            findings.append(Finding("Ближайшие объекты", "geo", target,
+                                    {"Найдено": str(len(pois)), "Список": "\n".join(lines)}, 0.8))
+
+        return ModuleResult(cls.name, target, True, findings,
+                            duration_ms=int((_time.time() - t0) * 1000))
+
+
+# ─────────── IMAGE HOSTING ───────────
+
+async def upload_to_host(image_bytes, filename="img.jpg"):
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post("https://catbox.moe/user/api.php",
+                             data={"reqtype": "fileupload"},
+                             files={"fileToUpload": (filename, image_bytes)})
+            if r.status_code == 200 and r.text.startswith("http"):
+                return r.text.strip()
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post("https://0x0.st",
+                             files={"file": (filename, image_bytes)},
+                             headers={"User-Agent": "osint-bot/1.0"})
+            if r.status_code == 200 and r.text.startswith("http"):
+                return r.text.strip()
+    except Exception:
+        pass
+    return None
+
+
+def build_search_links(image_url):
+    q = quote(image_url, safe="")
+    return {
+        "Yandex (лица)": f"https://yandex.ru/images/search?rpt=imageview&url={q}",
+        "Google Lens": f"https://lens.google.com/uploadbyurl?url={q}",
+        "Bing Visual": f"https://www.bing.com/images/searchbyimage?cbir=sbi&imgurl={q}",
+        "TinEye": f"https://tineye.com/search?url={q}",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════
+
+EMAIL_RE = re.compile(r"^[\w\.\-\+]+@[\w\-]+\.[\w\.\-]+$")
+PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_\.]{3,32}$")
+DOMAIN_RE = re.compile(r"^[a-z0-9\-]+\.[a-z]{2,}$")
+GEO_RE = re.compile(r"^-?\d{1,3}\.\d{3,}\s*[,;]\s*-?\d{1,3}\.\d{3,}$")
+
+
+def detect_type(target):
+    t = target.strip()
+    if EMAIL_RE.match(t):
+        return "email"
+    if PHONE_RE.match(t.replace(" ", "").replace("-", "")):
+        return "phone"
+    if DOMAIN_RE.match(t.lower()):
+        return "domain"
+    if GEO_RE.match(t):
+        return "geo"
+    if USERNAME_RE.match(t):
+        return "username"
+    return "text"
+
+
+TEXT_MODULES = [EmailModule(), UsernameModule(), PhoneModule(), TelegramModule()]
+
+
+async def run_all(target, ttype):
+    results = []
+    async with httpx.AsyncClient(timeout=settings.HTTP_TIMEOUT,
+                                 headers=DEFAULT_HEADERS,
+                                 follow_redirects=True) as client:
+        if ttype == "domain":
+            results.append(await DomainModule.run(target, client))
+        elif ttype == "geo":
+            results.append(await GeoModule.run(target, client))
+        elif ttype == "text":
+            results.append(await TextModule.run(target, client))
+        else:
+            for m in TEXT_MODULES:
+                if ttype in m.accepts:
+                    try:
+                        results.append(await m.run(target, client))
+                    except Exception as e:
+                        results.append(ModuleResult(m.name, target, False, error=str(e)))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        UI
+# ═══════════════════════════════════════════════════════════════
+
+logging.basicConfig(level=logging.INFO)
+router = Router()
+_running = set()
+_pending_photos = {}
+
+
+def main_kb(uid=None):
+    rows = [
+        [KeyboardButton(text="🔍 Сканировать"), KeyboardButton(text="📷 По фото")],
+        [KeyboardButton(text="🌐 Домен"), KeyboardButton(text="🗺 Гео")],
+        [KeyboardButton(text="📝 Текст"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="📊 Статистика")],
+    ]
+    if uid and is_admin(uid):
+        rows.append([KeyboardButton(text="🛠 Админка")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                               input_field_placeholder="Кинь цель, текст или координаты…")
+
+
+def result_kb(target):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Повторить", callback_data=f"rescan:{target}"),
+         InlineKeyboardButton(text="📄 Отчёт", callback_data=f"report:{target}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")],
+    ])
+
+
+def phone_kb(links):
+    items = list(links.items())
+    rows = [[InlineKeyboardButton(text=f"🔗 {n}", url=u)
+             for n, u in items[i:i+2]] for i in range(0, len(items), 2)]
+    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def photo_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти в интернете", callback_data="img:search")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")],
+    ])
+
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="a:stats"),
+         InlineKeyboardButton(text="📜 Логи", callback_data="a:logs")],
+        [InlineKeyboardButton(text="👥 Админы", callback_data="a:admins"),
+         InlineKeyboardButton(text="🏆 Топ", callback_data="a:top")],
+        [InlineKeyboardButton(text="📣 Рассылка", callback_data="a:broadcast")],
+        [InlineKeyboardButton(text="🚫 Бан", callback_data="a:ban"),
+         InlineKeyboardButton(text="✅ Разбан", callback_data="a:unban")],
+        [InlineKeyboardButton(text="⚙️ Лимит", callback_data="a:limit")],
+        [InlineKeyboardButton(text="🔍 Найти юзера", callback_data="a:find")],
+    ])
+
+
+def logs_filter_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Все", callback_data="a:logs:all"),
+         InlineKeyboardButton(text="⚠️ Warn", callback_data="a:logs:warning")],
+        [InlineKeyboardButton(text="❌ Error", callback_data="a:logs:error"),
+         InlineKeyboardButton(text="ℹ️ Info", callback_data="a:logs:info")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="a:back")],
+    ])
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        FORMATTERS
+# ═══════════════════════════════════════════════════════════════
+
+def fmt_card(target, ttype, results):
+    """Единая карточка."""
+    total = sum(len(r.findings) for r in results)
+    duration = sum(r.duration_ms for r in results)
+    short_target = target[:60] + ("…" if len(target) > 60 else "")
+
+    lines = [
+        f"🎯 <b>{short_target}</b>",
+        f"┌ 🧩 <b>Тип:</b> {ttype}",
+        f"├ 📊 <b>Находок:</b> {total}",
+        f"└ ⏱ <b>Время:</b> {duration} мс",
+        "",
+    ]
+
+    for r in results:
+        icon = "✅" if r.success else "❌"
+        lines.append(f"{icon} <b>{r.module_name}</b>")
+        if r.error:
+            lines.append(f"  ⚠️ <i>{r.error}</i>")
+        if not r.findings:
+            lines.append("  <i>— ничего —</i>")
+            lines.append("")
+            continue
+
+        for f in r.findings:
+            if f.category == "metadata":
+                continue
+            if "url" in f.data and len(f.data) <= 2:
+                lines.append(f"  • <a href='{f.data['url']}'>{f.source}</a>")
+            elif "Список" in f.data:
+                lines.append(f"  • <b>{f.source}</b> ({f.data.get('Найдено', '?')})")
+                for item in f.data["Список"].split("\n")[:5]:
+                    lines.append(f"      <code>{item[:60]}</code>")
+            elif "Ссылки" in f.data:
+                lines.append(f"  • <b>{f.source}</b> (кнопки внизу)")
+            else:
+                items = list(f.data.items())[:4]
+                preview = " | ".join(f"{k}: {str(v)[:40]}" for k, v in items)
+                lines.append(f"  • <b>{f.source}</b>")
+                lines.append(f"      {preview}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def fmt_phone(results):
+    tech, links = {}, {}
+    for r in results:
+        for f in r.findings:
+            if f.source == "Технические данные":
+                tech = f.data
+            elif f.source == "Ссылки для проверки":
+                links = f.data.get("Ссылки", {})
+    if not tech:
+        return "❌ Не удалось обработать номер.", {}
+    lines = [
+        "📱 <b>Анализ номера</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<b>E.164:</b> <code>{tech.get('E.164','')}</code>",
+        f"<b>Международный:</b> {tech.get('Международный','')}",
+        f"<b>Национальный:</b> {tech.get('Национальный','')}",
+        "",
+        f"🌍 <b>Регион:</b> {tech.get('Регион','—')}",
+        f"📡 <b>Оператор:</b> {tech.get('Оператор','—')}",
+        f"🔌 <b>Тип линии:</b> {tech.get('Тип линии','—')}",
+        f"✅ <b>Валидный:</b> {tech.get('Валидный','—')}",
+    ]
+    if tech.get("Часовые пояса"):
+        lines.append(f"🕒 <b>Часовые пояса:</b> {tech['Часовые пояса']}")
+    lines += ["", "👇 <b>Проверь вручную:</b>"]
+    return "\n".join(lines), links
+
+
+def fmt_metadata(findings):
+    if not findings:
+        return "📷 <b>Метаданные</b>\n\nЧисто."
+    lines = ["📷 <b>Метаданные файла</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for f in findings:
+        if f.source == "Ключевые следы":
+            lines.append("\n⚠️ <b>Что важно:</b>")
+            for w in f.data["Следы"].split("\n"):
+                lines.append(w)
+        else:
+            lines.append(f"\n📁 <b>{f.source}</b>")
+            for k, v in list(f.data.items())[:15]:
+                if k == "Google Maps":
+                    lines.append(f"  ▪ {k}: <a href='{v}'>карта</a>")
+                else:
+                    lines.append(f"  ▪ <b>{k}:</b> {str(v)[:80]}")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        SCAN
+# ═══════════════════════════════════════════════════════════════
+
+async def do_scan(msg, target):
+    uid = msg.from_user.id
+    if is_banned(uid):
+        await msg.answer("🚫 Ты забанен.")
+        return
+    limit = get_rate_limit(uid)
+    if limit > 0 and count_scans_last_hour(uid) >= limit:
+        await msg.answer(f"⛔ Лимит {limit}/час.")
+        return
+    if uid in _running:
+        await msg.answer("⏳ Уже идёт скан.")
+        return
+    _running.add(uid)
+
+    short = target[:80] + ("…" if len(target) > 80 else "")
+    status = await msg.answer(f"🔎 <b>Сканирую…</b>\n<code>{short}</code>")
+
+    try:
+        ttype = detect_type(target)
+        results = await run_all(target, ttype)
+
+        # телефон — спец-вывод с кнопками
+        if ttype == "phone":
+            text, links = fmt_phone(results)
+            kb = phone_kb(links) if links else result_kb(target)
+            await status.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        else:
+            text = fmt_card(target, ttype, results)
+            await status.edit_text(text, reply_markup=result_kb(target),
+                                   disable_web_page_preview=True)
+
+        total = sum(len(r.findings) for r in results)
+        log_scan(uid, target, ttype, total)
+        log("scan", uid, f"{target[:50]} ({ttype}) findings={total}")
+    except Exception as e:
+        await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
+        log("scan_error", uid, str(e), level="error")
+    finally:
+        _running.discard(uid)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        HANDLERS
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(CommandStart())
+async def start(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    log("start", m.from_user.id)
+    await m.answer(
+        "🕵️ <b>OSINT Bot</b>\n\n"
+        "Что умею:\n"
+        "▫️ <b>Email / username / телефон</b> — пробив\n"
+        "▫️ <b>Фото</b> — метаданные + поиск в интернете\n"
+        "▫️ <b>Домен</b> — WHOIS, IP, поддомены\n"
+        "▫️ <b>Координаты</b> — адрес + что рядом\n"
+        "▫️ <b>Текст</b> — вытащу email/телефоны/ссылки\n\n"
+        "Просто напиши цель 👇",
+        reply_markup=main_kb(m.from_user.id),
+    )
+
+
+@router.message(Command("help"))
+@router.message(F.text == "❓ Помощь")
+async def help_cmd(m: Message):
+    await m.answer(
+        "📖 <b>Как пользоваться</b>\n\n"
+        "▫️ Текст — email/ник/телефон/текст\n"
+        "▫️ Фото — метаданные + поиск\n"
+        "▫️ <code>example.com</code> — WHOIS\n"
+        "▫️ <code>55.7558, 37.6173</code> — гео\n\n"
+        "Команды: /scan /me /admin",
+        reply_markup=main_kb(m.from_user.id),
+    )
+
+
+@router.message(F.text == "👤 Профиль")
+@router.message(Command("me"))
+async def me(m: Message):
+    s = user_stats(m.from_user.id)
+    ts = datetime.fromtimestamp(s["first_seen"]).strftime("%Y-%m-%d") if s.get("first_seen") else "—"
+    await m.answer(
+        f"👤 <b>{m.from_user.full_name}</b>\n"
+        f"🆔 <code>{m.from_user.id}</code>\n"
+        f"📊 Сканов: <b>{s['total_scans']}</b>\n"
+        f"📅 С нами с: {ts}",
+        reply_markup=main_kb(m.from_user.id),
+    )
+
+
+@router.message(F.text == "📊 Статистика")
+async def my_stats(m: Message):
+    s = user_stats(m.from_user.id)
+    await m.answer(f"📊 Ты сделал <b>{s['total_scans']}</b> сканов.",
+                   reply_markup=main_kb(m.from_user.id))
+
+
+@router.message(F.text == "🔍 Сканировать")
+async def kb_scan(m: Message):
+    await m.answer("🔍 Кинь email, username или телефон одним сообщением.")
+
+
+@router.message(F.text == "📷 По фото")
+async def kb_photo(m: Message):
+    await m.answer("📷 Кинь фото — вытащу метаданные и дам ссылки для поиска.")
+
+
+@router.message(F.text == "🌐 Домен")
+async def kb_domain(m: Message):
+    await m.answer("🌐 Пришли домен, например <code>example.com</code>")
+
+
+@router.message(F.text == "🗺 Гео")
+async def kb_geo(m: Message):
+    await m.answer("🗺 Пришли координаты, например <code>55.7558, 37.6173</code>")
+
+
+@router.message(F.text == "📝 Текст")
+async def kb_text(m: Message):
+    await m.answer("📝 Пришли текст — вытащу email, телефоны, ссылки, упоминания.")
+
+
+@router.message(Command("scan"))
+async def scan_cmd(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: <code>/scan цель</code>")
+        return
+    await do_scan(m, parts[1].strip())
+
+
+@router.message(F.document | F.photo)
+async def handle_file(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    status = await m.answer("📷 <b>Читаю метаданные…</b>")
+    try:
+        if m.document:
+            file_id, filename = m.document.file_id, m.document.file_name or "doc"
+        else:
+            file_id, filename = m.photo[-1].file_id, "photo.jpg"
+        _pending_photos[m.from_user.id] = file_id
+        file = await m.bot.get_file(file_id)
+        buf = await m.bot.download_file(file.file_path)
+        data = buf.read()
+        findings = MetadataModule.analyze(data, filename)
+        kb = photo_kb() if m.photo else result_kb(filename)
+        await status.edit_text(fmt_metadata(findings), reply_markup=kb,
+                               disable_web_page_preview=True)
+        log_scan(m.from_user.id, filename, "metadata", len(findings))
+        log("file_uploaded", m.from_user.id, filename)
+    except Exception as e:
+        await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
+        log("file_error", m.from_user.id, str(e), level="error")
+
+
+@router.callback_query(F.data == "img:search")
+async def cb_img_search(cb: CallbackQuery):
+    uid = cb.from_user.id
+    file_id = _pending_photos.get(uid)
+    if not file_id:
+        await cb.answer("Кинь фото заново", show_alert=True)
+        return
+    await cb.answer("Загружаю…")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    status = await cb.message.answer("⏳ <b>Загружаю фото…</b>")
+    try:
+        file = await cb.bot.get_file(file_id)
+        buf = await cb.bot.download_file(file.file_path)
+        url = await upload_to_host(buf.read(), "photo.jpg")
+        if not url:
+            await status.edit_text("❌ Хостинг недоступен.")
+            return
+        links = build_search_links(url)
+        buttons = [[InlineKeyboardButton(text=f"🔍 {n}", url=u)]
+                   for n, u in links.items()]
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")])
+        text = (
+            "🖼 <b>Поиск по фото</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Фото:</b> <a href=\"{url}\">ссылка</a>\n\n"
+            "👇 Yandex — по лицам/СНГ, Google Lens — по объектам."
+        )
+        await status.edit_text(text,
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                               disable_web_page_preview=True)
+        log("img_search", uid, url)
+        _pending_photos.pop(uid, None)
+    except Exception as e:
+        await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
+
+
+@router.callback_query(F.data.startswith("rescan:"))
+async def cb_rescan(cb: CallbackQuery):
+    target = cb.data.split(":", 1)[1]
+    await cb.answer()
+    await do_scan(cb.message, target)
+
+
+@router.callback_query(F.data.startswith("report:"))
+async def cb_report(cb: CallbackQuery):
+    target = cb.data.split(":", 1)[1]
+    await cb.answer("Готовлю…")
+    ttype = detect_type(target)
+    results = await run_all(target, ttype)
+    md = render_report(target, ttype, results)
+    buf = BufferedInputFile(md.encode(), filename=f"report_{target[:20]}.md")
+    await cb.message.answer_document(buf, caption="📄 Отчёт")
+
+
+@router.callback_query(F.data == "delete")
+async def cb_delete(cb: CallbackQuery):
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    _pending_photos.pop(cb.from_user.id, None)
+    await cb.answer("Удалено")
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def text_scan(m: Message):
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    await do_scan(m, m.text.strip())
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        REPORT
+# ═══════════════════════════════════════════════════════════════
+
+def render_report(target, ttype, results):
+    total = sum(len(r.findings) for r in results)
+    out = [
+        "# OSINT Report", "",
+        f"**Target:** `{target}`  ",
+        f"**Type:** `{ttype}`  ",
+        f"**Generated:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}Z  ",
+        f"**Findings:** {total}", "", "---", "",
+    ]
+    for r in results:
+        out.append(f"## {r.module_name} {'✅' if r.success else '❌'}")
+        out.append(f"_duration: {r.duration_ms} ms_")
+        if r.error:
+            out.append(f"> error: `{r.error}`")
+        out.append("")
+        if not r.findings:
+            out.append("Ничего не найдено.\n")
+            continue
+        for f in r.findings:
+            out.append(f"- **{f.source}** (conf {f.confidence})")
+            for k, v in f.data.items():
+                out.append(f"    - {k}: `{v}`")
+        out.append("")
+    return "\n".join(out)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        ADMIN
+# ═══════════════════════════════════════════════════════════════
+
+class AS(StatesGroup):
+    admin_user = State()
+    ban_user = State()
+    limit_user = State()
+    broadcast = State()
+    find_user = State()
+
+
+@router.message(Command("admin"))
+@router.message(F.text == "🛠 Админка")
+async def cmd_admin(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    role = "👑 owner" if is_owner(m.from_user.id) else "🛡 admin"
+    await m.answer(f"🛠 <b>Админ-панель</b> ({role})\n\nВыбирай 👇",
+                   reply_markup=admin_kb())
+
+
+@router.callback_query(F.data == "a:back")
+async def cb_back(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer()
+    await cb.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:stats")
+async def cb_stats(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    g = global_stats()
+    await cb.message.edit_text(
+        f"📊 <b>Статистика</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Юзеров: <b>{g['users']}</b>\n"
+        f"🛡 Админов: <b>{g['admins']}</b>\n"
+        f"🚫 Бан: <b>{g['banned']}</b>\n"
+        f"🔎 Сканов: <b>{g['scans']}</b>\n"
+        f"📅 За 24ч: <b>{g['day']}</b>",
+        reply_markup=admin_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:logs")
+async def cb_logs_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await cb.message.edit_text("📜 <b>Логи</b> — фильтр:", reply_markup=logs_filter_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("a:logs:"))
+async def cb_logs_show(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    level = cb.data.split(":")[2]
+    level = None if level == "all" else level
+    rows = get_logs(25, level)
+    if not rows:
+        await cb.message.edit_text("📜 Пусто.", reply_markup=admin_kb())
+        return await cb.answer()
+    lines = [f"📜 <b>Логи ({len(rows)})</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        ts = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d %H:%M:%S")
+        ic = {"info": "ℹ️", "warning": "⚠️", "error": "❌"}.get(r["level"], "•")
+        uid = f" <code>{r['user_id']}</code>" if r["user_id"] else ""
+        det = f" — {r['details'][:60]}" if r["details"] else ""
+        lines.append(f"{ic} <code>{ts}</code> <b>{r['event']}</b>{uid}{det}")
+    await cb.message.edit_text("\n".join(lines)[:4000], reply_markup=admin_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:top")
+async def cb_top(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    rows = top_users(10)
+    lines = ["🏆 <b>Топ-10</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for i, u in enumerate(rows, 1):
+        un = f"@{u['username']}" if u["username"] else "—"
+        lines.append(f"{i}. <code>{u['user_id']}</code> {un} — <b>{u['total_scans']}</b>")
+    await cb.message.edit_text("\n".join(lines) or "Пусто.", reply_markup=admin_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:admins")
+async def cb_admins(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    rows = list_admins()
+    lines = ["👥 <b>Админы</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for a in rows:
+        role = "👑" if a["role"] == "owner" else "🛡"
+        un = f"@{a['username']}" if a["username"] else "—"
+        lines.append(f"{role} <code>{a['user_id']}</code> {un}")
+    if is_owner(cb.from_user.id):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Выдать", callback_data="a:add_admin"),
+             InlineKeyboardButton(text="➖ Снять", callback_data="a:del_admin")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="a:back")],
+        ])
+    else:
+        kb = admin_kb()
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:add_admin")
+async def cb_add_admin(cb: CallbackQuery, state: FSMContext):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer("Только owner", show_alert=True)
+    await state.set_state(AS.admin_user)
+    await state.update_data(action="add")
+    await cb.message.edit_text("➕ Пришли ID или @username будущего админа.")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:del_admin")
+async def cb_del_admin(cb: CallbackQuery, state: FSMContext):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer("Только owner", show_alert=True)
+    await state.set_state(AS.admin_user)
+    await state.update_data(action="del")
+    await cb.message.edit_text("➖ Пришли ID или @username для снятия.")
+    await cb.answer()
+
+
+@router.message(AS.admin_user)
+async def process_admin_user(m: Message, state: FSMContext):
+    if not is_owner(m.from_user.id):
+        return
+    data = await state.get_data()
+    u = find_user(m.text.strip())
+    await state.clear()
+    if not u:
+        await m.answer("❌ Не найден. Пусть напишет /start.")
+        return
+    if data.get("action") == "add":
+        ok = add_admin(u["user_id"], m.from_user.id)
+        if ok:
+            await m.answer(f"✅ <code>{u['user_id']}</code> теперь админ.",
+                           reply_markup=admin_kb())
+            try:
+                await m.bot.send_message(u["user_id"], "🛡 Тебе выдана админка. /admin")
+            except Exception:
+                pass
+        else:
+            await m.answer("⚠️ Уже админ.", reply_markup=admin_kb())
+    else:
+        ok = remove_admin(u["user_id"])
+        await m.answer("✅ Снят." if ok else "⚠️ Нельзя снять (owner).",
+                       reply_markup=admin_kb())
+
+
+@router.callback_query(F.data == "a:ban")
+async def cb_ban(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await state.set_state(AS.ban_user)
+    await state.update_data(action="ban")
+    await cb.message.edit_text("🚫 Пришли ID или @username для бана.")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a:unban")
+async def cb_unban(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await state.set_state(AS.ban_user)
+    await state.update_data(action="unban")
+    await cb.message.edit_text("✅ Пришли ID или @username для разбана.")
+    await cb.answer()
+
+
+@router.message(AS.ban_user)
+async def process_ban(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    data = await state.get_data()
+    action = data.get("action", "ban")
+    u = find_user(m.text.strip())
+    await state.clear()
+    if not u:
+        await m.answer("❌ Не найден.")
+        return
+    if is_admin(u["user_id"]) and not is_owner(m.from_user.id):
+        await m.answer("⚠️ Нельзя банить админа.", reply_markup=admin_kb())
+        return
+    set_ban(u["user_id"], action == "ban", m.from_user.id)
+    word = "забанен" if action == "ban" else "разбанен"
+    await m.answer(f"✅ <code>{u['user_id']}</code> {word}.", reply_markup=admin_kb())
+
+
+@router.callback_query(F.data == "a:limit")
+async def cb_limit(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await state.set_state(AS.limit_user)
+    await cb.message.edit_text(
+        "⚙️ Формат: <code>ID_or_@username лимит</code>\n"
+        "Пример: <code>123456789 50</code>\n"
+        "Лимит 0 — без ограничений.")
+    await cb.answer()
+
+
+@router.message(AS.limit_user)
+async def process_limit(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    parts = m.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await m.answer("Формат: <code>ID лимит</code>")
+        return
+    u = find_user(parts[0])
+    if not u:
+        await m.answer("❌ Не найден.")
+        return
+    limit = int(parts[1])
+    set_rate_limit(u["user_id"], limit if limit > 0 else None, m.from_user.id)
+    await state.clear()
+    await m.answer(f"✅ Лимит: <b>{limit or '∞'}</b>/час", reply_markup=admin_kb())
+
+
+@router.callback_query(F.data == "a:broadcast")
+async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await state.set_state(AS.broadcast)
+    await cb.message.edit_text("📣 Пришли текст рассылки. /cancel — отмена.")
+    await cb.answer()
+
+
+@router.message(AS.broadcast)
+async def process_broadcast(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    await state.clear()
+    text = m.text or ""
+    if not text:
+        return
+    ids = all_user_ids()
+    sent = failed = 0
+    await m.answer(f"📣 Рассылка на {len(ids)} юзеров…")
+    for uid in ids:
+        try:
+            await m.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+    log("broadcast", m.from_user.id, f"sent={sent} failed={failed}", level="warning")
+    await m.answer(f"✅ Готово.\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>",
+                   reply_markup=admin_kb())
+
+
+@router.callback_query(F.data == "a:find")
+async def cb_find(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Нет доступа", show_alert=True)
+    await state.set_state(AS.find_user)
+    await cb.message.edit_text("🔍 Пришли ID или @username.")
+    await cb.answer()
+
+
+@router.message(AS.find_user)
+async def process_find(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    u = find_user(m.text.strip())
+    await state.clear()
+    if not u:
+        await m.answer("❌ Не найден.", reply_markup=admin_kb())
+        return
+    ts1 = datetime.fromtimestamp(u["first_seen"]).strftime("%Y-%m-%d %H:%M")
+    ts2 = datetime.fromtimestamp(u["last_seen"] or u["first_seen"]).strftime("%Y-%m-%d %H:%M")
+    lim = u["rate_limit"] if u["rate_limit"] is not None else settings.RATE_LIMIT_PER_HOUR
+    await m.answer(
+        f"👤 <b>Юзер</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <code>{u['user_id']}</code>\n"
+        f"🔗 @{u['username'] or '—'}\n"
+        f"📛 {u['full_name'] or '—'}\n"
+        f"🔎 Сканов: <b>{u['total_scans']}</b>\n"
+        f"⚙️ Лимит/час: <b>{lim}</b>\n"
+        f"🚫 Бан: <b>{'да' if u['is_banned'] else 'нет'}</b>\n"
+        f"🛡 Админ: <b>{'да' if is_admin(u['user_id']) else 'нет'}</b>\n"
+        f"📅 Первый: {ts1}\n🕒 Последний: {ts2}",
+        reply_markup=admin_kb())
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    await state.clear()
+    await m.answer("Отменено.", reply_markup=admin_kb())
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        MAIN
+# ═══════════════════════════════════════════════════════════════
+
+async def main():
+    init_db()
+    bot = Bot(settings.BOT_TOKEN,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    log("bot_started", None, "polling started")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
