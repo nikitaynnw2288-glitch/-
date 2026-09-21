@@ -1,9 +1,12 @@
 """
-OSINT Bot — всё в одном файле + реферальная система.
+OSINT Bot — всё в одном файле.
+Модули: email, username, phone, metadata, domain, text, geo, telegram, geo_ai.
 """
 
 import asyncio
+import base64
 import io
+import json
 import logging
 import random
 import re
@@ -53,7 +56,8 @@ class Settings(BaseSettings):
     ADMIN_IDS: str = ""
     RATE_LIMIT_PER_HOUR: int = 10
     HTTP_TIMEOUT: int = 15
-    REF_BONUS: int = 5              # 🔹 REF: бонусных сканов за 1 реферала
+    REF_BONUS: int = 5
+    GEMINI_KEY: str = ""          # ← ключ Gemini из Railway Variables
 
     @property
     def initial_admins(self) -> set:
@@ -104,11 +108,10 @@ def init_db():
             user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
             first_seen INTEGER, last_seen INTEGER, total_scans INTEGER DEFAULT 0,
             is_banned INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT NULL,
-            ref_code TEXT UNIQUE,          -- 🔹 REF
-            ref_by INTEGER DEFAULT NULL,   -- 🔹 REF: кто пригласил
-            ref_count INTEGER DEFAULT 0,   -- 🔹 REF: сколько привёл
-            bonus_scans INTEGER DEFAULT 0  -- 🔹 REF: бонусные сканы
-        );
+            ref_code TEXT UNIQUE,
+            ref_by INTEGER DEFAULT NULL,
+            ref_count INTEGER DEFAULT 0,
+            bonus_scans INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
             target TEXT, target_type TEXT, findings_count INTEGER, created_at INTEGER);
@@ -143,7 +146,6 @@ def log(event, user_id=None, details="", level="info", conn=None):
             c.execute(sql, args)
 
 
-# 🔹 REF: генерация уникального реф-кода
 def _gen_ref_code(length=8) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(random.choices(alphabet, k=length))
@@ -158,7 +160,6 @@ def _unique_ref_code(c) -> str:
 
 
 def ensure_user(uid, uname=None, full_name=None, ref_code=None):
-    """🔹 REF: добавляем параметр ref_code — код того, кто пригласил."""
     now = int(_time.time())
     with db() as c:
         existing = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -166,9 +167,7 @@ def ensure_user(uid, uname=None, full_name=None, ref_code=None):
             c.execute("UPDATE users SET username=?, full_name=?, last_seen=? WHERE user_id=?",
                       (uname, full_name, now, uid))
         else:
-            # генерим свой код
             my_code = _unique_ref_code(c)
-            # проверяем реф-код пригласившего
             referrer_id = None
             if ref_code:
                 row = c.execute("SELECT user_id FROM users WHERE ref_code=?",
@@ -184,7 +183,6 @@ def ensure_user(uid, uname=None, full_name=None, ref_code=None):
 
             log("user_registered", uid, f"@{uname} ref_by={referrer_id}", conn=c)
 
-            # 🔹 REF: начисляем бонус рефереру
             if referrer_id:
                 c.execute("""UPDATE users
                     SET ref_count = ref_count + 1,
@@ -194,7 +192,6 @@ def ensure_user(uid, uname=None, full_name=None, ref_code=None):
                     f"+{settings.REF_BONUS} за реферала {uid}", conn=c)
 
 
-# 🔹 REF: получить инфу о рефералах юзера
 def get_ref_info(uid):
     with db() as c:
         r = c.execute("""SELECT ref_code, ref_count, bonus_scans, ref_by
@@ -204,7 +201,6 @@ def get_ref_info(uid):
         return dict(r)
 
 
-# 🔹 REF: топ рефереров
 def top_referrers(limit=10):
     with db() as c:
         return [dict(r) for r in c.execute(
@@ -246,13 +242,12 @@ def count_scans_last_hour(uid):
                          (uid, int(_time.time()) - 3600)).fetchone()["c"]
 
 
-# 🔹 REF: эффективный лимит = базовый + бонусные сканы
 def effective_limit(uid):
     base = get_rate_limit(uid)
     with db() as c:
         r = c.execute("SELECT bonus_scans FROM users WHERE user_id=?", (uid,)).fetchone()
         bonus = r["bonus_scans"] if r else 0
-    if base == 0:  # 0 = безлимит
+    if base == 0:
         return 0
     return base + bonus
 
@@ -279,7 +274,7 @@ def global_stats():
             "day": c.execute("SELECT COUNT(*) c FROM scans WHERE created_at>strftime('%s','now')-86400").fetchone()["c"],
             "banned": c.execute("SELECT COUNT(*) c FROM users WHERE is_banned=1").fetchone()["c"],
             "admins": c.execute("SELECT COUNT(*) c FROM admins").fetchone()["c"],
-            "refs": c.execute("SELECT COALESCE(SUM(ref_count),0) c FROM users").fetchone()["c"],  # 🔹 REF
+            "refs": c.execute("SELECT COALESCE(SUM(ref_count),0) c FROM users").fetchone()["c"],
         }
 
 
@@ -873,6 +868,81 @@ class GeoModule(BaseModule):
                             duration_ms=int((_time.time() - t0) * 1000))
 
 
+# ─────────── GEO AI (по содержимому фото) ───────────
+
+class GeoAIModule(BaseModule):
+    """Определяет локацию по визуальному содержимому фото через Gemini."""
+    name = "geo_ai"
+    accepts = set()
+
+    GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/"
+                  "models/gemini-2.0-flash:generateContent")
+
+    PROMPT = (
+        "You are a geolocation expert. Analyze this photo and determine "
+        "where it was taken. Look for: architecture style, signage/language, "
+        "license plates, terrain, vegetation, sun position, landmarks, "
+        "business names, currency, plugs, clothes. "
+        "Return ONLY valid JSON, no markdown, no code fences, with fields: "
+        '{"country": "str", "city": "str or null", "confidence": 0.0-1.0, '
+        '"reasoning": "short explanation in Russian", "google_maps_query": "str"}. '
+        "If unsure, give your best guess with low confidence."
+    )
+
+    @staticmethod
+    async def analyze(image_bytes: bytes, filename: str = "photo.jpg") -> Finding | None:
+        if not settings.GEMINI_KEY:
+            return None
+
+        img_b64 = base64.b64encode(image_bytes).decode()
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": GeoAIModule.PROMPT},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+                ]
+            }],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 600},
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(
+                    f"{GeoAIModule.GEMINI_URL}?key={settings.GEMINI_KEY}",
+                    json=payload,
+                )
+                if r.status_code != 200:
+                    log("geo_ai_error", None, f"HTTP {r.status_code}: {r.text[:200]}", level="error")
+                    return None
+                data = r.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                return None
+            info = json.loads(m.group(0))
+
+            return Finding(
+                source="🌍 AI-геолокация",
+                category="geo_ai",
+                target=filename,
+                data={
+                    "Страна": info.get("country", "—"),
+                    "Город": info.get("city") or "—",
+                    "Уверенность": f"{int(info.get('confidence', 0) * 100)}%",
+                    "Почему": info.get("reasoning", "—"),
+                    "Google Maps": f"https://maps.google.com/?q={quote(str(info.get('google_maps_query', '')))}",
+                },
+                confidence=float(info.get("confidence", 0.5)),
+            )
+        except Exception as e:
+            log("geo_ai_error", None, str(e), level="error")
+            return None
+
+
+# ─────────── IMAGE HOSTING ───────────
+
 async def upload_to_host(image_bytes, filename="img.jpg"):
     try:
         async with httpx.AsyncClient(timeout=30) as c:
@@ -970,7 +1040,7 @@ def main_kb(uid=None):
         [KeyboardButton(text="🔍 Сканировать"), KeyboardButton(text="📷 По фото")],
         [KeyboardButton(text="🌐 Домен"), KeyboardButton(text="🗺 Гео")],
         [KeyboardButton(text="📝 Текст"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="🎁 Рефералы"), KeyboardButton(text="📊 Статистика")],  # 🔹 REF
+        [KeyboardButton(text="🎁 Рефералы"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="❓ Помощь")],
     ]
     if uid and is_admin(uid):
@@ -997,12 +1067,12 @@ def phone_kb(links):
 
 def photo_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌍 Гео по фото (AI)", callback_data="img:geo_ai")],
         [InlineKeyboardButton(text="🔍 Найти в интернете", callback_data="img:search")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")],
     ])
 
 
-# 🔹 REF: клавиатура для рефералов
 def ref_kb(bot_username: str, ref_code: str):
     link = f"https://t.me/{bot_username}?start=ref_{ref_code}"
     share = f"https://t.me/share/url?url={quote(link)}&text={quote('Попробуй этого OSINT-бота 👇')}"
@@ -1018,7 +1088,7 @@ def admin_kb():
          InlineKeyboardButton(text="📜 Логи", callback_data="a:logs")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="a:admins"),
          InlineKeyboardButton(text="🏆 Топ", callback_data="a:top")],
-        [InlineKeyboardButton(text="🎁 Топ рефереров", callback_data="a:topref")],  # 🔹 REF
+        [InlineKeyboardButton(text="🎁 Топ рефереров", callback_data="a:topref")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="a:broadcast")],
         [InlineKeyboardButton(text="🚫 Бан", callback_data="a:ban"),
          InlineKeyboardButton(text="✅ Разбан", callback_data="a:unban")],
@@ -1131,7 +1201,6 @@ def fmt_metadata(findings):
     return "\n".join(lines)
 
 
-# 🔹 REF: карточка рефералов
 def fmt_ref(uid, bot_username, stats):
     link = f"https://t.me/{bot_username}?start=ref_{stats['ref_code']}"
     return (
@@ -1155,9 +1224,9 @@ async def do_scan(msg, target):
     if is_banned(uid):
         await msg.answer("🚫 Ты забанен.")
         return
-    limit = effective_limit(uid)  # 🔹 REF: учитываем бонусные
+    limit = effective_limit(uid)
     if limit > 0 and count_scans_last_hour(uid) >= limit:
-        await msg.answer(f"⛔ Лимит {limit}/час.\n💡 Пригласи друзей через /ref — получишь +5 сканов за каждого.")
+        await msg.answer(f"⛔ Лимит {limit}/час.\n💡 Пригласи друзей через /ref — +5 сканов за каждого.")
         return
     if uid in _running:
         await msg.answer("⏳ Уже идёт скан.")
@@ -1193,7 +1262,6 @@ async def do_scan(msg, target):
 #                        HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
-# 🔹 REF: /start принимает deep-link payload
 @router.message(CommandStart(deep_link=True))
 async def start_ref(m: Message, command: CommandObject):
     payload = command.args or ""
@@ -1201,14 +1269,12 @@ async def start_ref(m: Message, command: CommandObject):
     if payload.startswith("ref_"):
         ref_code = payload[4:].upper()
     ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name, ref_code)
-
-    me = await m.bot.get_me()
     stats = get_ref_info(m.from_user.id) or {}
     text = (
         "🕵️ <b>OSINT Bot</b>\n\n"
         "Что умею:\n"
         "▫️ <b>Email / username / телефон</b> — пробив\n"
-        "▫️ <b>Фото</b> — метаданные + поиск\n"
+        "▫️ <b>Фото</b> — метаданные + AI-гео + поиск\n"
         "▫️ <b>Домен</b> — WHOIS, IP, поддомены\n"
         "▫️ <b>Координаты</b> — адрес + что рядом\n"
         "▫️ <b>Текст</b> — email/телефоны/ссылки\n\n"
@@ -1226,7 +1292,7 @@ async def start(m: Message):
         "🕵️ <b>OSINT Bot</b>\n\n"
         "Что умею:\n"
         "▫️ <b>Email / username / телефон</b> — пробив\n"
-        "▫️ <b>Фото</b> — метаданные + поиск в интернете\n"
+        "▫️ <b>Фото</b> — метаданные + AI-гео + поиск в интернете\n"
         "▫️ <b>Домен</b> — WHOIS, IP, поддомены\n"
         "▫️ <b>Координаты</b> — адрес + что рядом\n"
         "▫️ <b>Текст</b> — вытащу email/телефоны/ссылки\n\n"
@@ -1241,7 +1307,7 @@ async def help_cmd(m: Message):
     await m.answer(
         "📖 <b>Как пользоваться</b>\n\n"
         "▫️ Текст — email/ник/телефон/текст\n"
-        "▫️ Фото — метаданные + поиск\n"
+        "▫️ Фото — метаданные + AI-гео + поиск\n"
         "▫️ <code>example.com</code> — WHOIS\n"
         "▫️ <code>55.7558, 37.6173</code> — гео\n\n"
         "Команды: /scan /ref /me /admin",
@@ -1249,7 +1315,6 @@ async def help_cmd(m: Message):
     )
 
 
-# 🔹 REF: команда /ref + кнопка
 @router.message(Command("ref"))
 @router.message(F.text == "🎁 Рефералы")
 async def ref_cmd(m: Message):
@@ -1312,7 +1377,7 @@ async def kb_scan(m: Message):
 
 @router.message(F.text == "📷 По фото")
 async def kb_photo(m: Message):
-    await m.answer("📷 Кинь фото — вытащу метаданные и дам ссылки для поиска.")
+    await m.answer("📷 Кинь фото — вытащу метаданные, сделаю AI-гео и дам ссылки для поиска.")
 
 
 @router.message(F.text == "🌐 Домен")
@@ -1361,6 +1426,48 @@ async def handle_file(m: Message):
     except Exception as e:
         await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
         log("file_error", m.from_user.id, str(e), level="error")
+
+
+@router.callback_query(F.data == "img:geo_ai")
+async def cb_geo_ai(cb: CallbackQuery):
+    uid = cb.from_user.id
+    file_id = _pending_photos.get(uid)
+    if not file_id:
+        await cb.answer("Кинь фото заново", show_alert=True)
+        return
+
+    if not settings.GEMINI_KEY:
+        await cb.answer("Нужен GEMINI_KEY в Railway Variables", show_alert=True)
+        return
+
+    await cb.answer("Анализирую…")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    status = await cb.message.answer("🧠 <b>AI анализирует фото…</b>\n<i>~5-10 секунд</i>")
+
+    try:
+        file = await cb.bot.get_file(file_id)
+        buf = await cb.bot.download_file(file.file_path)
+        finding = await GeoAIModule.analyze(buf.read(), "photo.jpg")
+
+        if not finding:
+            await status.edit_text("❌ Не удалось определить локацию.")
+            return
+
+        lines = ["🌍 <b>AI-геолокация</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for k, v in finding.data.items():
+            if k == "Google Maps":
+                lines.append(f"  • {k}: <a href='{v}'>открыть на карте</a>")
+            else:
+                lines.append(f"  • <b>{k}:</b> {v}")
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data="delete")],
+        ])
+        await status.edit_text("\n".join(lines), reply_markup=kb,
+                               disable_web_page_preview=True)
+        log("geo_ai", uid, finding.data.get("Страна", "?"))
+    except Exception as e:
+        await status.edit_text(f"💥 Ошибка: <code>{e}</code>")
 
 
 @router.callback_query(F.data == "img:search")
@@ -1424,12 +1531,6 @@ async def cb_delete(cb: CallbackQuery):
         pass
     _pending_photos.pop(cb.from_user.id, None)
     await cb.answer("Удалено")
-
-
-@router.message(F.text & ~F.text.startswith("/"))
-async def text_scan(m: Message):
-    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-    await do_scan(m, m.text.strip())
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1509,7 +1610,6 @@ async def cb_stats(cb: CallbackQuery):
     await cb.answer()
 
 
-# 🔹 REF: топ рефереров в админке
 @router.callback_query(F.data == "a:topref")
 async def cb_top_ref(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -1780,6 +1880,24 @@ async def cmd_cancel(m: Message, state: FSMContext):
         return
     await state.clear()
     await m.answer("Отменено.", reply_markup=admin_kb())
+
+
+# ═══════════════════════════════════════════════════════════════
+#                        FALLBACK TEXT SCAN (ВСЕГДА ПОСЛЕДНИЙ!)
+# ═══════════════════════════════════════════════════════════════
+
+BUTTON_TEXTS = {
+    "🔍 Сканировать", "📷 По фото", "🌐 Домен", "🗺 Гео", "📝 Текст",
+    "👤 Профиль", "🎁 Рефералы", "📊 Статистика", "❓ Помощь", "🛠 Админка",
+}
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def text_scan(m: Message):
+    if m.text.strip() in BUTTON_TEXTS:
+        return
+    ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    await do_scan(m, m.text.strip())
 
 
 # ═══════════════════════════════════════════════════════════════
