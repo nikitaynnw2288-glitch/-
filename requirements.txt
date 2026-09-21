@@ -6,3 +6,4 @@ Pillow>=10.3.0
 exifread>=3.0.0
 geopy>=2.4.0
 whois21>=1.0.0
+cryptography>=42.0.0
